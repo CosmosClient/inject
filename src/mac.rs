@@ -7,9 +7,12 @@
 //! 4. Writing the patched shellcode into the remote process
 //! 5. Spawning a remote Mach thread that executes the shellcode
 //!
-//! The shellcode creates a real pthread from the injected Mach thread (since many
+//! The shellcode promotes the injected Mach thread to a real pthread (since many
 //! APIs like `dlopen` depend on `pthread_self()`), then calls `dlopen` to load the
-//! target library — triggering its `#[ctor]` constructor.
+//! target library — triggering its `#[ctor]` constructor. Both threads then exit
+//! (the pthread by returning from its start routine, the Mach thread via
+//! `thread_terminate` if promotion failed), so an injection leaves no thread
+//! spinning in the target.
 //!
 //! Based on Jonathan Levin's inject.c from <http://newosxbook.com/src.jl?tree=listings&file=inject.c>,
 //! updated for modern macOS with the Mach-thread-to-pthread promotion technique.
@@ -55,6 +58,16 @@ const X86_THREAD_STATE64_COUNT: u32 = 42;
 // for the markers it patches and the control flow). `SHELLCODE` is the array
 // for the target architecture.
 include!(concat!(env!("OUT_DIR"), "/shellcode.rs"));
+
+// ---------------------------------------------------------------------------
+// Mach port lifecycle
+// ---------------------------------------------------------------------------
+
+/// Give back a send right we hold in our own task. Best-effort: a failure
+/// here means the port was already gone, which is fine.
+unsafe fn release_port(port: MachPort) {
+    unsafe { mach_port_deallocate(mach_task_self(), port) };
+}
 
 // ---------------------------------------------------------------------------
 // ARM64 thread state structures (repr(C) to match kernel layout)
@@ -123,6 +136,9 @@ unsafe extern "C" {
         new_protection: i32,
     ) -> KernReturn;
 
+    /// Deallocate a send right in a task's IPC space.
+    fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
+
     /// Create a thread in a remote task and immediately start it running
     /// with the given register state.
     fn thread_create_running(
@@ -145,11 +161,13 @@ const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut::<std::ffi::c_voi
 ///
 /// Takes the static shellcode template, replaces placeholder markers with runtime
 /// addresses, and appends enough space for the full library path (null-terminated).
+/// Returns `None` if any required symbol could not be resolved — patching a null
+/// address in would crash the remote thread.
 ///
 /// This works because the injector and target process share the same dyld
 /// shared cache, so function addresses resolved in our process are valid in
 /// the remote process too.
-fn build_patched_shellcode(lib_path: &str) -> Vec<u8> {
+fn build_patched_shellcode(lib_path: &str) -> Option<Vec<u8>> {
     // Find where the "LIBLIBLIB" placeholder starts in the template.
     // Everything before it is executable code + function pointer slots.
     let lib_placeholder_offset = SHELLCODE
@@ -170,14 +188,20 @@ fn build_patched_shellcode(lib_path: &str) -> Vec<u8> {
     code[lib_placeholder_offset..lib_placeholder_offset + path_bytes.len()]
         .copy_from_slice(path_bytes);
 
-    // Resolve function addresses from our own address space and patch them in
-    let pthread_create_sym = CString::new("pthread_create_from_mach_thread").unwrap();
-    let pthread_exit_sym = CString::new("pthread_exit").unwrap();
-
-    let addr_pthread_create: u64 =
-        unsafe { libc::dlsym(RTLD_DEFAULT as *mut _, pthread_create_sym.as_ptr()) } as u64;
-    let addr_pthread_exit: u64 =
-        unsafe { libc::dlsym(RTLD_DEFAULT as *mut _, pthread_exit_sym.as_ptr()) } as u64;
+    // Resolve function addresses from our own address space and patch them in.
+    let resolve = |name: &str| -> Option<u64> {
+        let c_name = CString::new(name).unwrap();
+        let addr = unsafe { libc::dlsym(RTLD_DEFAULT, c_name.as_ptr()) };
+        if addr.is_null() {
+            eprintln!("dlsym({name}) returned null — cannot build shellcode");
+            None
+        } else {
+            Some(addr as u64)
+        }
+    };
+    let addr_pthread_create = resolve("pthread_create_from_mach_thread")?;
+    let addr_thread_self = resolve("mach_thread_self")?;
+    let addr_thread_terminate = resolve("thread_terminate")?;
     let addr_dlopen: u64 = libc::dlopen as *const () as u64;
 
     // Walk the code portion byte-by-byte looking for 8-byte placeholder markers
@@ -185,15 +209,18 @@ fn build_patched_shellcode(lib_path: &str) -> Vec<u8> {
         if &code[i..i + 8] == b"PTHRDCRT" {
             code[i..i + 8].copy_from_slice(&addr_pthread_create.to_ne_bytes());
         }
-        if &code[i..i + 8] == b"PTHRDEXT" {
-            code[i..i + 8].copy_from_slice(&addr_pthread_exit.to_ne_bytes());
-        }
         if &code[i..i + 8] == b"DLOPEN__" {
             code[i..i + 8].copy_from_slice(&addr_dlopen.to_ne_bytes());
         }
+        if &code[i..i + 8] == b"MTHRSELF" {
+            code[i..i + 8].copy_from_slice(&addr_thread_self.to_ne_bytes());
+        }
+        if &code[i..i + 8] == b"THRTERM_" {
+            code[i..i + 8].copy_from_slice(&addr_thread_terminate.to_ne_bytes());
+        }
     }
 
-    code
+    Some(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +245,19 @@ unsafe fn inject_inner(pid: pid_t, lib_path: &str) -> bool {
         return false;
     }
 
+    // The task port is only needed while setting up; release it either way so
+    // repeated injections don't accumulate send rights in our IPC space.
+    let success = unsafe { inject_with_task(remote_task, lib_path) };
+    unsafe { release_port(remote_task) };
+    success
+}
+
+unsafe fn inject_with_task(remote_task: MachPort, lib_path: &str) -> bool {
     // -- Step 2: Prepare and patch the shellcode --
     // We do this first so we know the exact size to allocate in the remote process.
-    let code = build_patched_shellcode(lib_path);
+    let Some(code) = build_patched_shellcode(lib_path) else {
+        return false;
+    };
     let code_size = code.len() as MachVmSize;
 
     // -- Step 3: Allocate remote memory for the stack and shellcode --
@@ -292,50 +329,45 @@ unsafe fn inject_inner(pid: pid_t, lib_path: &str) -> bool {
     // middle of our allocated stack (leaving headroom in both directions).
     let stack_middle = remote_stack + (STACK_SIZE / 2);
 
-    #[cfg(target_arch = "aarch64")]
-    let success = unsafe {
-        let mut state = std::mem::zeroed::<ArmThreadState64>();
-        state.pc = remote_code;
-        state.sp = stack_middle;
+    unsafe {
+        let mut thread: MachPort = 0;
 
-        let kr = thread_create_running(
-            remote_task,
-            ARM_THREAD_STATE64,
-            &state as *const _ as *const u8,
-            ARM_THREAD_STATE64_COUNT,
-            &mut 0u32,
-        );
+        #[cfg(target_arch = "aarch64")]
+        let kr = {
+            let mut state = std::mem::zeroed::<ArmThreadState64>();
+            state.pc = remote_code;
+            state.sp = stack_middle;
+            thread_create_running(
+                remote_task,
+                ARM_THREAD_STATE64,
+                &state as *const _ as *const u8,
+                ARM_THREAD_STATE64_COUNT,
+                &mut thread,
+            )
+        };
 
-        if kr != KERN_SUCCESS {
-            eprintln!("thread_create_running failed (kern_return: {kr})");
-            false
-        } else {
-            true
-        }
-    };
-
-    #[cfg(target_arch = "x86_64")]
-    let success = unsafe {
-        let mut state = std::mem::zeroed::<X86ThreadState64>();
-        state.rip = remote_code;
-        state.rsp = stack_middle;
-        state.rbp = stack_middle;
-
-        let kr = thread_create_running(
-            remote_task,
-            X86_THREAD_STATE64,
-            &state as *const _ as *const u8,
-            X86_THREAD_STATE64_COUNT,
-            &mut 0u32,
-        );
+        #[cfg(target_arch = "x86_64")]
+        let kr = {
+            let mut state = std::mem::zeroed::<X86ThreadState64>();
+            state.rip = remote_code;
+            state.rsp = stack_middle;
+            state.rbp = stack_middle;
+            thread_create_running(
+                remote_task,
+                X86_THREAD_STATE64,
+                &state as *const _ as *const u8,
+                X86_THREAD_STATE64_COUNT,
+                &mut thread,
+            )
+        };
 
         if kr != KERN_SUCCESS {
             eprintln!("thread_create_running failed (kern_return: {kr})");
             false
         } else {
+            // The thread keeps running on its own; we don't need its send right.
+            release_port(thread);
             true
         }
-    };
-
-    success
+    }
 }
